@@ -209,16 +209,27 @@ jobs:
       - name: Compile Single Binary
         run: |
           set -e
-          # Cari NDK yang valid punya binder_manager.h (hindari NDK 30 jika header belum lengkap)
-          HEADER_PATH=$(find "$ANDROID_HOME/ndk" -name "binder_manager.h" | sort -V | tail -n 1)
+          echo "Daftar NDK terpasang:"
+          ls -la "$ANDROID_HOME/ndk" || true
+
+          HEADER_PATH=$(find "$ANDROID_HOME/ndk" -name "binder_manager.h" 2>/dev/null | sort -V | tail -n 1 || true)
+
           if [ -z "$HEADER_PATH" ]; then
-            echo "Menginstall NDK 27.2.12479018..."
-            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" >/dev/null
-            HEADER_PATH=$(find "$ANDROID_HOME/ndk/27.2.12479018" -name "binder_manager.h" | head -n 1)
+            echo "Header binder_manager.h tidak ditemukan di NDK bawaan, download NDK 27.1.12297006..."
+            SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name "sdkmanager" | head -n 1)
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" --install "ndk;27.1.12297006"
+            HEADER_PATH=$(find "$ANDROID_HOME/ndk/27.1.12297006" -name "binder_manager.h" | head -n 1)
+          fi
+
+          if [ -z "$HEADER_PATH" ]; then
+            echo "FATAL: binder_manager.h tetap tidak ditemukan!"
+            exit 1
           fi
 
           NDK_ROOT=$(echo "$HEADER_PATH" | sed -E 's|(/ndk/[^/]+).*|\1|')
           NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          SYSROOT="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
           CXX=$(find "$NDK_BIN" -name "aarch64-linux-android3[0-5]-clang++" | sort -V | tail -n 1)
           AIDL=$(find "$ANDROID_HOME/build-tools" -name "aidl" | sort -V | tail -n 1)
 
@@ -231,6 +242,8 @@ jobs:
             aidl/vendor/oplus/hardware/touch/IOplusTouch.aidl
 
           "$CXX" -std=c++20 -O2 -Wall -Wextra \
+            --sysroot="$SYSROOT" \
+            -I "$SYSROOT/usr/include" \
             -I gen/include \
             -static-libstdc++ \
             -Wl,--gc-sections \
@@ -238,11 +251,3 @@ jobs:
             -lbinder_ndk -llog -ldl \
             -o out/vendor.oplus.hardware.touch-service
 
-          "$NDK_BIN/llvm-strip" --strip-all out/vendor.oplus.hardware.touch-service
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: oplus-touch-bridge-package
-          path: out/
-          
