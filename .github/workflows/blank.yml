@@ -40,7 +40,10 @@ jobs:
           EOF
 
           cat << 'EOF' > main.cpp
+          #ifndef _GNU_SOURCE
           #define _GNU_SOURCE
+          #endif
+
           #include <android/binder_ibinder.h>
           #include <android/binder_manager.h>
           #include <android/binder_process.h>
@@ -53,7 +56,6 @@ jobs:
           #include <cstring>
           #include <string>
 
-          // Deklarasi eksplisit agar header AIDL VINTF bisa dicompile dengan NDK standar
           extern "C" __attribute__((visibility("default")))
           void AIBinder_markVintfStability(AIBinder* binder) {
               using Fn = void (*)(AIBinder*);
@@ -92,7 +94,6 @@ jobs:
           static bool setXiaomiDt2w(bool enable) {
               const char* v = enable ? "1" : "0";
               
-              // 1. Cek sysfs umum (Fts / Goodix / Novatek / Focaltech)
               const char* sysfs_nodes[] = {
                   "/sys/touchpanel/double_tap",
                   "/sys/class/touch/touch_dev/double_tap",
@@ -107,14 +108,11 @@ jobs:
                   }
               }
 
-              // 2. Fallback ke /dev/xiaomi-touch (Modern Xiaomi Kernel)
               int fd = open("/dev/xiaomi-touch", O_RDWR | O_CLOEXEC);
               if (fd >= 0) {
-                  // Mode 14 = Touch_Doubletap_Mode di mayoritas driver xiaomi_touch
                   int buf[3] = {0, 14, enable ? 1 : 0};
-                  int ret = ioctl(fd, _IOW('T', 0, int[3]), buf);
+                  int ret = ioctl(fd, _IOW('T', 0, int), buf);
                   if (ret < 0) {
-                      // Fallback ke magic number lama 0x5400
                       ret = ioctl(fd, 0x5400, buf);
                   }
                   close(fd);
@@ -160,7 +158,6 @@ jobs:
               ScopedAStatus touchWriteNodeFile(int32_t deviceId, int32_t nodeFlag,
                                                const std::string& value, int32_t* _aidl_return) override {
                   LOGI("touchWriteNodeFile dev=%d nodeFlag=%d value=%s", deviceId, nodeFlag, value.c_str());
-                  // nodeFlag 1 biasanya DOUBLE_TAP_ENABLE di Oplus Touch HAL
                   if (nodeFlag == 1) {
                       bool enable = (value == "1" || value == "1\n");
                       if (setXiaomiDt2w(enable)) {
@@ -212,13 +209,21 @@ jobs:
       - name: Compile Single Binary
         run: |
           set -e
+          # Cari NDK yang valid punya binder_manager.h (hindari NDK 30 jika header belum lengkap)
+          HEADER_PATH=$(find "$ANDROID_HOME/ndk" -name "binder_manager.h" | sort -V | tail -n 1)
+          if [ -z "$HEADER_PATH" ]; then
+            echo "Menginstall NDK 27.2.12479018..."
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" >/dev/null
+            HEADER_PATH=$(find "$ANDROID_HOME/ndk/27.2.12479018" -name "binder_manager.h" | head -n 1)
+          fi
+
+          NDK_ROOT=$(echo "$HEADER_PATH" | sed -E 's|(/ndk/[^/]+).*|\1|')
+          NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CXX=$(find "$NDK_BIN" -name "aarch64-linux-android3[0-5]-clang++" | sort -V | tail -n 1)
           AIDL=$(find "$ANDROID_HOME/build-tools" -name "aidl" | sort -V | tail -n 1)
-          NDK_BIN=$(find "$ANDROID_HOME/ndk" -path "*/toolchains/llvm/prebuilt/linux-x86_64/bin" | sort -V | tail -n 1)
-          
-          # Pastikan memakai API level >= 30 untuk dukungan penuh libbinder_ndk
-          CXX=$(find "$NDK_BIN" -name "aarch64-linux-android3[0-9]-clang++" | sort -V | tail -n 1)
-          
+
           echo "Using AIDL: $AIDL"
+          echo "Using NDK_ROOT: $NDK_ROOT"
           echo "Using CXX: $CXX"
 
           "$AIDL" --lang=ndk --structured --stability=vintf -I aidl -h gen/include -o gen/src \
