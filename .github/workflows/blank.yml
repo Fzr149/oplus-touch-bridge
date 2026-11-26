@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Generate Source Files
         run: |
-          mkdir -p aidl/vendor/oplus/hardware/touch gen/include gen/src out
+          mkdir -p aidl/vendor/oplus/hardware/touch gen/include gen/src out/etc/init out/etc/vintf/manifest
 
           cat << 'EOF' > aidl/vendor/oplus/hardware/touch/OplusTouchStatus.aidl
           package vendor.oplus.hardware.touch;
@@ -41,6 +41,7 @@ jobs:
 
           cat << 'EOF' > main.cpp
           #define _GNU_SOURCE
+          #include <android/binder_ibinder.h>
           #include <android/binder_manager.h>
           #include <android/binder_process.h>
           #include <android/log.h>
@@ -52,12 +53,7 @@ jobs:
           #include <cstring>
           #include <string>
 
-          #include <aidl/vendor/oplus/hardware/touch/BnOplusTouch.h>
-          #include <aidl/vendor/oplus/hardware/touch/OplusTouchStatus.h>
-
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "oplus-touch-bridge", __VA_ARGS__)
-          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "oplus-touch-bridge", __VA_ARGS__)
-
+          // Deklarasi eksplisit agar header AIDL VINTF bisa dicompile dengan NDK standar
           extern "C" __attribute__((visibility("default")))
           void AIBinder_markVintfStability(AIBinder* binder) {
               using Fn = void (*)(AIBinder*);
@@ -72,6 +68,12 @@ jobs:
                   real_fn(binder);
               }
           }
+
+          #include <aidl/vendor/oplus/hardware/touch/BnOplusTouch.h>
+          #include <aidl/vendor/oplus/hardware/touch/OplusTouchStatus.h>
+
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "oplus-touch-bridge", __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "oplus-touch-bridge", __VA_ARGS__)
 
           using aidl::vendor::oplus::hardware::touch::BnOplusTouch;
           using aidl::vendor::oplus::hardware::touch::OplusTouchStatus;
@@ -89,18 +91,32 @@ jobs:
 
           static bool setXiaomiDt2w(bool enable) {
               const char* v = enable ? "1" : "0";
-              if (writeNode("/sys/touchpanel/double_tap", v)) {
-                  LOGI("DT2W set via /sys/touchpanel/double_tap = %s", v);
-                  return true;
+              
+              // 1. Cek sysfs umum (Fts / Goodix / Novatek / Focaltech)
+              const char* sysfs_nodes[] = {
+                  "/sys/touchpanel/double_tap",
+                  "/sys/class/touch/touch_dev/double_tap",
+                  "/sys/devices/platform/goodix_ts.0/double_tap",
+                  "/proc/touchpanel/double_tap_enable"
+              };
+
+              for (const char* node : sysfs_nodes) {
+                  if (writeNode(node, v)) {
+                      LOGI("DT2W set via %s = %s", node, v);
+                      return true;
+                  }
               }
-              if (writeNode("/sys/class/touch/touch_dev/double_tap", v)) {
-                  LOGI("DT2W set via /sys/class/touch/touch_dev/double_tap = %s", v);
-                  return true;
-              }
+
+              // 2. Fallback ke /dev/xiaomi-touch (Modern Xiaomi Kernel)
               int fd = open("/dev/xiaomi-touch", O_RDWR | O_CLOEXEC);
               if (fd >= 0) {
+                  // Mode 14 = Touch_Doubletap_Mode di mayoritas driver xiaomi_touch
                   int buf[3] = {0, 14, enable ? 1 : 0};
-                  int ret = ioctl(fd, 0x5400, buf);
+                  int ret = ioctl(fd, _IOW('T', 0, int[3]), buf);
+                  if (ret < 0) {
+                      // Fallback ke magic number lama 0x5400
+                      ret = ioctl(fd, 0x5400, buf);
+                  }
                   close(fd);
                   if (ret == 0) {
                       LOGI("DT2W set via /dev/xiaomi-touch ioctl = %d", enable ? 1 : 0);
@@ -144,8 +160,9 @@ jobs:
               ScopedAStatus touchWriteNodeFile(int32_t deviceId, int32_t nodeFlag,
                                                const std::string& value, int32_t* _aidl_return) override {
                   LOGI("touchWriteNodeFile dev=%d nodeFlag=%d value=%s", deviceId, nodeFlag, value.c_str());
+                  // nodeFlag 1 biasanya DOUBLE_TAP_ENABLE di Oplus Touch HAL
                   if (nodeFlag == 1) {
-                      bool enable = (value == "1");
+                      bool enable = (value == "1" || value == "1\n");
                       if (setXiaomiDt2w(enable)) {
                           g_dt2w_enabled = enable;
                       }
@@ -156,30 +173,59 @@ jobs:
           };
 
           int main() {
-              ABinderProcess_setThreadPoolMaxThreadCount(1);
+              ABinderProcess_setThreadPoolMaxThreadCount(2);
               ABinderProcess_startThreadPool();
 
               auto service = ndk::SharedRefBase::make<OplusTouch>();
-              std::string instance = std::string(OplusTouch::descriptor) + "/default";
+              const std::string instance = std::string(OplusTouch::descriptor) + "/default";
               binder_status_t status = AServiceManager_addService(service->asBinder().get(), instance.c_str());
-              LOGI("Register %s status=%d", instance.c_str(), status);
-
+              
+              if (status != STATUS_OK) {
+                  LOGE("Gagal register %s, status=%d", instance.c_str(), status);
+                  return 1;
+              }
+              
+              LOGI("Berhasil register %s", instance.c_str());
               ABinderProcess_joinThreadPool();
-              return 1;
+              return 0;
           }
+          EOF
+
+          cat << 'EOF' > out/etc/init/vendor.oplus.hardware.touch-service.rc
+          service vendor.oplus.hardware.touch /vendor/bin/hw/vendor.oplus.hardware.touch-service
+              class hal
+              user system
+              group system input
+              capabilities SYS_NICE
+          EOF
+
+          cat << 'EOF' > out/etc/vintf/manifest/vendor.oplus.hardware.touch.xml
+          <manifest version="1.0" type="device">
+              <hal format="aidl">
+                  <name>vendor.oplus.hardware.touch</name>
+                  <version>1</version>
+                  <fqname>IOplusTouch/default</fqname>
+              </hal>
+          </manifest>
           EOF
 
       - name: Compile Single Binary
         run: |
+          set -e
           AIDL=$(find "$ANDROID_HOME/build-tools" -name "aidl" | sort -V | tail -n 1)
-          NDK=$(find "$ANDROID_HOME/ndk" -path "*/toolchains/llvm/prebuilt/linux-x86_64/bin" | sort -V | tail -n 1)
-          CXX=$(find "$NDK" -name "aarch64-linux-android*-clang++" | sort -V | tail -n 1)
+          NDK_BIN=$(find "$ANDROID_HOME/ndk" -path "*/toolchains/llvm/prebuilt/linux-x86_64/bin" | sort -V | tail -n 1)
+          
+          # Pastikan memakai API level >= 30 untuk dukungan penuh libbinder_ndk
+          CXX=$(find "$NDK_BIN" -name "aarch64-linux-android3[0-9]-clang++" | sort -V | tail -n 1)
+          
+          echo "Using AIDL: $AIDL"
+          echo "Using CXX: $CXX"
 
-          $AIDL --lang=ndk --structured --stability=vintf -I aidl -h gen/include -o gen/src \
+          "$AIDL" --lang=ndk --structured --stability=vintf -I aidl -h gen/include -o gen/src \
             aidl/vendor/oplus/hardware/touch/OplusTouchStatus.aidl \
             aidl/vendor/oplus/hardware/touch/IOplusTouch.aidl
 
-          $CXX -std=c++20 -O2 -Wall \
+          "$CXX" -std=c++20 -O2 -Wall -Wextra \
             -I gen/include \
             -static-libstdc++ \
             -Wl,--gc-sections \
@@ -187,10 +233,11 @@ jobs:
             -lbinder_ndk -llog -ldl \
             -o out/vendor.oplus.hardware.touch-service
 
-          "$NDK/llvm-strip" --strip-all out/vendor.oplus.hardware.touch-service
+          "$NDK_BIN/llvm-strip" --strip-all out/vendor.oplus.hardware.touch-service
 
-      - name: Upload Binary
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vendor.oplus.hardware.touch-service
-          path: out/vendor.oplus.hardware.touch-service
+          name: oplus-touch-bridge-package
+          path: out/
+          
