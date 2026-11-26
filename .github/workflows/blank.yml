@@ -1,0 +1,196 @@
+name: Build Oplus Touch Bridge
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Source Files
+        run: |
+          mkdir -p aidl/vendor/oplus/hardware/touch gen/include gen/src out
+
+          cat << 'EOF' > aidl/vendor/oplus/hardware/touch/OplusTouchStatus.aidl
+          package vendor.oplus.hardware.touch;
+
+          @VintfStability
+          @Backing(type="int")
+          enum OplusTouchStatus {
+              SUCCESS = 0,
+              FAILED = 1,
+              Unimplemented = 2,
+          }
+          EOF
+
+          cat << 'EOF' > aidl/vendor/oplus/hardware/touch/IOplusTouch.aidl
+          package vendor.oplus.hardware.touch;
+
+          import vendor.oplus.hardware.touch.OplusTouchStatus;
+
+          @VintfStability
+          interface IOplusTouch {
+              OplusTouchStatus initialize(int deviceId);
+              boolean isTouchNodeSupport(int deviceId, String name, String info, int nodeFlag);
+              String touchReadNodeFile(int deviceId, int nodeFlag);
+              int touchWriteNodeFile(int deviceId, int nodeFlag, String value);
+          }
+          EOF
+
+          cat << 'EOF' > main.cpp
+          #define _GNU_SOURCE
+          #include <android/binder_manager.h>
+          #include <android/binder_process.h>
+          #include <android/log.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <sys/ioctl.h>
+          #include <unistd.h>
+          #include <cerrno>
+          #include <cstring>
+          #include <string>
+
+          #include <aidl/vendor/oplus/hardware/touch/BnOplusTouch.h>
+          #include <aidl/vendor/oplus/hardware/touch/OplusTouchStatus.h>
+
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "oplus-touch-bridge", __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "oplus-touch-bridge", __VA_ARGS__)
+
+          extern "C" __attribute__((visibility("default")))
+          void AIBinder_markVintfStability(AIBinder* binder) {
+              using Fn = void (*)(AIBinder*);
+              static Fn real_fn = nullptr;
+              if (!real_fn) {
+                  void* handle = dlopen("libbinder_ndk.so", RTLD_NOW);
+                  if (handle) {
+                      real_fn = reinterpret_cast<Fn>(dlsym(handle, "AIBinder_markVintfStability"));
+                  }
+              }
+              if (real_fn && binder) {
+                  real_fn(binder);
+              }
+          }
+
+          using aidl::vendor::oplus::hardware::touch::BnOplusTouch;
+          using aidl::vendor::oplus::hardware::touch::OplusTouchStatus;
+          using ndk::ScopedAStatus;
+
+          static bool g_dt2w_enabled = false;
+
+          static bool writeNode(const char* path, const char* val) {
+              int fd = open(path, O_WRONLY | O_CLOEXEC);
+              if (fd < 0) return false;
+              ssize_t r = write(fd, val, strlen(val));
+              close(fd);
+              return r >= 0;
+          }
+
+          static bool setXiaomiDt2w(bool enable) {
+              const char* v = enable ? "1" : "0";
+              if (writeNode("/sys/touchpanel/double_tap", v)) {
+                  LOGI("DT2W set via /sys/touchpanel/double_tap = %s", v);
+                  return true;
+              }
+              if (writeNode("/sys/class/touch/touch_dev/double_tap", v)) {
+                  LOGI("DT2W set via /sys/class/touch/touch_dev/double_tap = %s", v);
+                  return true;
+              }
+              int fd = open("/dev/xiaomi-touch", O_RDWR | O_CLOEXEC);
+              if (fd >= 0) {
+                  int buf[3] = {0, 14, enable ? 1 : 0};
+                  int ret = ioctl(fd, 0x5400, buf);
+                  close(fd);
+                  if (ret == 0) {
+                      LOGI("DT2W set via /dev/xiaomi-touch ioctl = %d", enable ? 1 : 0);
+                      return true;
+                  }
+                  LOGE("ioctl /dev/xiaomi-touch gagal: %s", strerror(errno));
+              } else {
+                  LOGE("Node DT2W tidak ditemukan: %s", strerror(errno));
+              }
+              return false;
+          }
+
+          class OplusTouch : public BnOplusTouch {
+            public:
+              ScopedAStatus initialize(int32_t deviceId, OplusTouchStatus* _aidl_return) override {
+                  LOGI("initialize deviceId=%d", deviceId);
+                  *_aidl_return = OplusTouchStatus::SUCCESS;
+                  return ScopedAStatus::ok();
+              }
+
+              ScopedAStatus isTouchNodeSupport(int32_t deviceId, const std::string& name,
+                                               const std::string& info, int32_t nodeFlag,
+                                               bool* _aidl_return) override {
+                  LOGI("isTouchNodeSupport dev=%d name=%s info=%s nodeFlag=%d",
+                       deviceId, name.c_str(), info.c_str(), nodeFlag);
+                  *_aidl_return = true;
+                  return ScopedAStatus::ok();
+              }
+
+              ScopedAStatus touchReadNodeFile(int32_t deviceId, int32_t nodeFlag,
+                                              std::string* _aidl_return) override {
+                  (void)deviceId;
+                  if (nodeFlag == 1) {
+                      *_aidl_return = g_dt2w_enabled ? "1" : "0";
+                  } else {
+                      *_aidl_return = "0";
+                  }
+                  return ScopedAStatus::ok();
+              }
+
+              ScopedAStatus touchWriteNodeFile(int32_t deviceId, int32_t nodeFlag,
+                                               const std::string& value, int32_t* _aidl_return) override {
+                  LOGI("touchWriteNodeFile dev=%d nodeFlag=%d value=%s", deviceId, nodeFlag, value.c_str());
+                  if (nodeFlag == 1) {
+                      bool enable = (value == "1");
+                      if (setXiaomiDt2w(enable)) {
+                          g_dt2w_enabled = enable;
+                      }
+                  }
+                  *_aidl_return = 0;
+                  return ScopedAStatus::ok();
+              }
+          };
+
+          int main() {
+              ABinderProcess_setThreadPoolMaxThreadCount(1);
+              ABinderProcess_startThreadPool();
+
+              auto service = ndk::SharedRefBase::make<OplusTouch>();
+              std::string instance = std::string(OplusTouch::descriptor) + "/default";
+              binder_status_t status = AServiceManager_addService(service->asBinder().get(), instance.c_str());
+              LOGI("Register %s status=%d", instance.c_str(), status);
+
+              ABinderProcess_joinThreadPool();
+              return 1;
+          }
+          EOF
+
+      - name: Compile Single Binary
+        run: |
+          AIDL=$(find "$ANDROID_HOME/build-tools" -name "aidl" | sort -V | tail -n 1)
+          NDK=$(find "$ANDROID_HOME/ndk" -path "*/toolchains/llvm/prebuilt/linux-x86_64/bin" | sort -V | tail -n 1)
+          CXX=$(find "$NDK" -name "aarch64-linux-android*-clang++" | sort -V | tail -n 1)
+
+          $AIDL --lang=ndk --structured --stability=vintf -I aidl -h gen/include -o gen/src \
+            aidl/vendor/oplus/hardware/touch/OplusTouchStatus.aidl \
+            aidl/vendor/oplus/hardware/touch/IOplusTouch.aidl
+
+          $CXX -std=c++20 -O2 -Wall \
+            -I gen/include \
+            -static-libstdc++ \
+            -Wl,--gc-sections \
+            main.cpp $(find gen/src -name "*.cpp") \
+            -lbinder_ndk -llog -ldl \
+            -o out/vendor.oplus.hardware.touch-service
+
+          "$NDK/llvm-strip" --strip-all out/vendor.oplus.hardware.touch-service
+
+      - name: Upload Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor.oplus.hardware.touch-service
+          path: out/vendor.oplus.hardware.touch-service
