@@ -1,0 +1,332 @@
+name: oplus-aod-bridge
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write files
+        run: |
+          mkdir -p src out/odm/bin/hw out/odm/etc/init out/odm/etc/vintf/manifest
+          cat > src/aod_bridge.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <android/binder_ibinder.h>
+          #include <android/binder_parcel.h>
+          #include <android/binder_status.h>
+          #include <android/log.h>
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <pthread.h>
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          binder_exception_t AServiceManager_addService(AIBinder *binder, const char *instance);
+          void AIBinder_markVintfStability(AIBinder *binder);
+          bool ABinderProcess_setThreadPoolMaxThreadCount(uint32_t numThreads);
+          void ABinderProcess_startThreadPool(void);
+          void ABinderProcess_joinThreadPool(void);
+
+          #define TAG "oplus-aod-bridge"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+          #define DESCRIPTOR "vendor.oplus.hardware.displaypanelfeature.IDisplayPanelFeature"
+          #define INSTANCE DESCRIPTOR "/default"
+          #define IFACE_VERSION 1
+          #define IFACE_HASH "39afca22ac77253421ad681eeb2bae0c6ff62c13"
+
+          #ifndef DOZE_NODE
+          #define DOZE_NODE "/sys/class/mi_display/disp-DSI-0/doze_brightness"
+          #endif
+          #ifndef DELAY_MS
+          #define DELAY_MS 1500
+          #endif
+
+          #define TX_GET_VALUE 1
+          #define TX_SET_VALUE 2
+          #define TX_GET_INFO 3
+          #define TX_GET_HASH 0xfffffe
+          #define TX_GET_VERSION 0xffffff
+
+          #define FEATURE_AOD_LEVEL 7
+          #define FEATURE_AOD_STATE 217
+          #define AOD_STATE_ENTER 2
+          #define AOD_STATE_EXIT 0
+          #define CAPS_VALUE 15
+          #define MAX_ARRAY 64
+
+          static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+          static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+          static int g_pending = 0;
+          static int g_level = 1;
+          static int64_t g_deadline = 0;
+          static int g_get_logs = 0;
+
+          static int64_t now_ms(void) {
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+          }
+
+          static int write_node(const char *v) {
+              int fd = open(DOZE_NODE, O_WRONLY | O_CLOEXEC);
+              if (fd < 0) {
+                  int e = errno;
+                  LOGE("open %s: %s", DOZE_NODE, strerror(e));
+                  return -e;
+              }
+              size_t n = strlen(v);
+              ssize_t r = write(fd, v, n);
+              int e = errno;
+              close(fd);
+              if (r != (ssize_t)n) {
+                  LOGE("write %s <- %s: %s", DOZE_NODE, v, strerror(e));
+                  return -(e ? e : EIO);
+              }
+              LOGI("doze_brightness <- %s", v);
+              return 0;
+          }
+
+          static int read_node(void) {
+              char b[16];
+              int fd = open(DOZE_NODE, O_RDONLY | O_CLOEXEC);
+              if (fd < 0) return 0;
+              ssize_t r = read(fd, b, sizeof(b) - 1);
+              close(fd);
+              if (r <= 0) return 0;
+              b[r] = 0;
+              return atoi(b);
+          }
+
+          static void *worker(void *arg) {
+              (void)arg;
+              for (;;) {
+                  pthread_mutex_lock(&g_lock);
+                  while (!g_pending) pthread_cond_wait(&g_cond, &g_lock);
+                  pthread_mutex_unlock(&g_lock);
+                  for (;;) {
+                      usleep(50000);
+                      pthread_mutex_lock(&g_lock);
+                      if (!g_pending) {
+                          pthread_mutex_unlock(&g_lock);
+                          break;
+                      }
+                      if (now_ms() >= g_deadline) {
+                          int lvl = g_level;
+                          g_pending = 0;
+                          pthread_mutex_unlock(&g_lock);
+                          char s[8];
+                          snprintf(s, sizeof(s), "%d", lvl);
+                          write_node("0");
+                          write_node(s);
+                          break;
+                      }
+                      pthread_mutex_unlock(&g_lock);
+                  }
+              }
+              return NULL;
+          }
+
+          static void arm_doze(void) {
+              pthread_mutex_lock(&g_lock);
+              g_deadline = now_ms() + DELAY_MS;
+              if (!g_pending) {
+                  g_pending = 1;
+                  pthread_cond_signal(&g_cond);
+              }
+              pthread_mutex_unlock(&g_lock);
+          }
+
+          static void disarm_doze(void) {
+              pthread_mutex_lock(&g_lock);
+              g_pending = 0;
+              pthread_mutex_unlock(&g_lock);
+              write_node("0");
+          }
+
+          static binder_status_t write_ok(AParcel *out) {
+              AStatus *st = AStatus_newOk();
+              binder_status_t s = AParcel_writeStatusHeader(out, st);
+              AStatus_delete(st);
+              return s;
+          }
+
+          static binder_status_t reply_int(AParcel *out, int32_t v) {
+              binder_status_t s = write_ok(out);
+              if (s != STATUS_OK) return s;
+              return AParcel_writeInt32(out, v);
+          }
+
+          static void *on_create(void *args) { return args; }
+          static void on_destroy(void *user) { (void)user; }
+
+          static binder_status_t on_transact(AIBinder *binder, transaction_code_t code,
+                                             const AParcel *in, AParcel *out) {
+              (void)binder;
+              binder_status_t s;
+              int32_t feature = 0, len = 0;
+
+              switch (code) {
+              case TX_GET_VALUE: {
+                  s = AParcel_readInt32(in, &feature);
+                  if (s != STATUS_OK) return s;
+                  s = AParcel_readInt32(in, &len);
+                  if (s != STATUS_OK) return s;
+                  if (len > MAX_ARRAY) return STATUS_BAD_VALUE;
+                  int32_t vals[MAX_ARRAY];
+                  for (int i = 0; i < MAX_ARRAY; i++) vals[i] = 0;
+                  if (len > 0) {
+                      if (feature == FEATURE_AOD_LEVEL) vals[0] = read_node() == 2 ? 1 : 0;
+                      else if (feature == FEATURE_AOD_STATE) vals[0] = CAPS_VALUE;
+                  }
+                  if (g_get_logs < 40) {
+                      g_get_logs++;
+                      LOGI("get feature=%d len=%d -> %d", feature, len, len > 0 ? vals[0] : 0);
+                  }
+                  s = reply_int(out, 0);
+                  if (s != STATUS_OK) return s;
+                  s = AParcel_writeInt32(out, len);
+                  if (s != STATUS_OK || len <= 0) return s;
+                  for (int i = 0; i < len; i++) {
+                      s = AParcel_writeInt32(out, vals[i]);
+                      if (s != STATUS_OK) return s;
+                  }
+                  return STATUS_OK;
+              }
+
+              case TX_SET_VALUE: {
+                  s = AParcel_readInt32(in, &feature);
+                  if (s != STATUS_OK) return s;
+                  s = AParcel_readInt32(in, &len);
+                  if (s != STATUS_OK) return s;
+                  int32_t first = 0;
+                  if (len > MAX_ARRAY) return STATUS_BAD_VALUE;
+                  for (int i = 0; i < len; i++) {
+                      int32_t v = 0;
+                      s = AParcel_readInt32(in, &v);
+                      if (s != STATUS_OK) return s;
+                      if (i == 0) first = v;
+                  }
+                  LOGI("set feature=%d len=%d first=%d", feature, len, len > 0 ? first : 0);
+                  if (len > 0) {
+                      if (feature == FEATURE_AOD_STATE) {
+                          if (first == AOD_STATE_ENTER) arm_doze();
+                          else if (first == AOD_STATE_EXIT) disarm_doze();
+                      } else if (feature == FEATURE_AOD_LEVEL) {
+                          pthread_mutex_lock(&g_lock);
+                          if (first == 0) g_level = 1;
+                          else if (first == 1) g_level = 2;
+                          pthread_mutex_unlock(&g_lock);
+                      }
+                  }
+                  return reply_int(out, 0);
+              }
+
+              case TX_GET_INFO:
+                  s = reply_int(out, -95);
+                  if (s != STATUS_OK) return s;
+                  return AParcel_writeInt32(out, 0);
+
+              case TX_GET_VERSION:
+                  return reply_int(out, IFACE_VERSION);
+
+              case TX_GET_HASH:
+                  s = write_ok(out);
+                  if (s != STATUS_OK) return s;
+                  return AParcel_writeString(out, IFACE_HASH, (int32_t)strlen(IFACE_HASH));
+
+              default:
+                  LOGE("unknown transaction: %u", (unsigned)code);
+                  return STATUS_UNKNOWN_TRANSACTION;
+              }
+          }
+
+          int main(void) {
+              pthread_t th;
+              if (pthread_create(&th, NULL, worker, NULL) != 0) {
+                  LOGE("pthread_create failed");
+                  return 1;
+              }
+              pthread_detach(th);
+              ABinderProcess_setThreadPoolMaxThreadCount(2);
+              AIBinder_Class *cls = AIBinder_Class_define(DESCRIPTOR, on_create, on_destroy, on_transact);
+              if (!cls) {
+                  LOGE("AIBinder_Class_define failed");
+                  return 1;
+              }
+              AIBinder *bn = AIBinder_new(cls, NULL);
+              if (!bn) {
+                  LOGE("AIBinder_new failed");
+                  return 1;
+              }
+              AIBinder_markVintfStability(bn);
+              binder_exception_t ex = AServiceManager_addService(bn, INSTANCE);
+              if (ex != EX_NONE) {
+                  LOGE("addService %s failed: %d", INSTANCE, (int)ex);
+                  return 1;
+              }
+              LOGI("registered: %s", INSTANCE);
+              ABinderProcess_startThreadPool();
+              ABinderProcess_joinThreadPool();
+              return 1;
+          }
+          EOF
+          cat > out/odm/etc/init/vendor.oplus.hardware.displaypanelfeature-bridge.rc <<'EOF'
+          service vendor.oplus.displaypanelfeature-bridge /odm/bin/hw/vendor.oplus.hardware.displaypanelfeature-bridge-service
+              interface aidl vendor.oplus.hardware.displaypanelfeature.IDisplayPanelFeature/default
+              class hal
+              user root
+              group system
+          EOF
+          cat > out/odm/etc/vintf/manifest/manifest_displaypanelfeature_bridge.xml <<'EOF'
+          <manifest version="1.0" type="device">
+              <hal format="aidl">
+                  <name>vendor.oplus.hardware.displaypanelfeature</name>
+                  <version>1</version>
+                  <fqname>IDisplayPanelFeature/default</fqname>
+              </hal>
+          </manifest>
+          EOF
+
+      - name: Build
+        run: |
+          set -e
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_NDK:-}}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            NDK=$(ls -d /usr/local/lib/android/sdk/ndk/* | sort -V | tail -n1)
+          fi
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          CC="$BIN/aarch64-linux-android30-clang"
+          OUT=out/odm/bin/hw/vendor.oplus.hardware.displaypanelfeature-bridge-service
+          mkdir -p stubs
+          for f in AIBinder_Class_define AIBinder_new AIBinder_markVintfStability AServiceManager_addService AParcel_readInt32 AParcel_writeInt32 AParcel_writeString AParcel_writeStatusHeader AStatus_newOk AStatus_delete ABinderProcess_setThreadPoolMaxThreadCount ABinderProcess_startThreadPool ABinderProcess_joinThreadPool; do
+            echo "void $f(void){}"
+          done > stubs/stub.c
+          "$CC" -shared -fPIC -nostdlib -Wl,-soname,libbinder_ndk.so -o stubs/libbinder_ndk.so stubs/stub.c
+          "$CC" -std=gnu11 -O2 -Wall -Wextra -fPIE -pie -Wl,-z,max-page-size=16384 \
+            -o "$OUT" src/aod_bridge.c -Lstubs -lbinder_ndk -llog
+          "$BIN/llvm-strip" "$OUT"
+          chmod 755 "$OUT"
+          ls -l "$OUT"
+
+      - name: Check
+        run: |
+          set -e
+          OUT=out/odm/bin/hw/vendor.oplus.hardware.displaypanelfeature-bridge-service
+          "$BIN/llvm-readelf" -d "$OUT" | grep NEEDED
+          "$BIN/llvm-readelf" -d "$OUT" | grep -q 'libbinder_ndk.so'
+          if "$BIN/llvm-readelf" -d "$OUT" | grep -q 'libc++_shared'; then exit 1; fi
+          python3 -c "import xml.dom.minidom as m; m.parse('out/odm/etc/vintf/manifest/manifest_displaypanelfeature_bridge.xml')"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: aod-bridge
+          path: out/
