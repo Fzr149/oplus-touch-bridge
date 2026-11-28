@@ -47,10 +47,9 @@ jobs:
           static pthread_mutex_t smu = PTHREAD_MUTEX_INITIALIZER;
           static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
           static pthread_cond_t cv;
-          static int g_target;
           static unsigned g_gen;
+          static int g_screen = 1;
           static int g_pref = 1;
-          static long long last_kick;
           static int budget = 400;
           static int g_dummy;
 
@@ -169,73 +168,67 @@ jobs:
               L(ANDROID_LOG_INFO, "%s %d ret %d [ %s]", op, id, r, b);
           }
 
-          static void doze_target(int t)
+          static int pref_get(void)
           {
-              if (doze_read() != t)
-                  doze_write(t);
+              int p;
               pthread_mutex_lock(&mu);
-              g_target = t;
+              p = g_pref;
+              pthread_mutex_unlock(&mu);
+              return p;
+          }
+
+          static void screen_event(int on)
+          {
+              if (on)
+                  doze_write(0);
+              pthread_mutex_lock(&mu);
+              g_screen = on;
               g_gen++;
               pthread_cond_signal(&cv);
               pthread_mutex_unlock(&mu);
           }
 
-          static long long now_ms(void)
+          static int wait_ms(int ms, unsigned seen)
           {
               struct timespec ts;
+              int changed;
               clock_gettime(CLOCK_MONOTONIC, &ts);
-              return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000L;
-          }
-
-          static void kick(void)
-          {
-              long long n = now_ms();
-              int t;
-              pthread_mutex_lock(&mu);
-              if (n - last_kick < 300) {
-                  pthread_mutex_unlock(&mu);
-                  return;
+              ts.tv_nsec += (long)ms * 1000000L;
+              while (ts.tv_nsec >= 1000000000L) {
+                  ts.tv_sec++;
+                  ts.tv_nsec -= 1000000000L;
               }
-              last_kick = n;
-              t = g_pref;
+              pthread_mutex_lock(&mu);
+              while (g_gen == seen) {
+                  if (pthread_cond_timedwait(&cv, &mu, &ts) == ETIMEDOUT)
+                      break;
+              }
+              changed = (g_gen != seen);
               pthread_mutex_unlock(&mu);
-              doze_target(t);
+              return changed;
           }
 
           static void *worker(void *unused)
           {
-              static const int delays[4] = {250, 500, 750, 1500};
               unsigned seen = 0;
-              int i, t, changed;
-              struct timespec ts;
+              int on;
               (void)unused;
               for (;;) {
                   pthread_mutex_lock(&mu);
                   while (g_gen == seen)
                       pthread_cond_wait(&cv, &mu);
                   seen = g_gen;
+                  on = g_screen;
                   pthread_mutex_unlock(&mu);
-                  for (i = 0; i < 4; i++) {
-                      clock_gettime(CLOCK_MONOTONIC, &ts);
-                      ts.tv_nsec += (long)delays[i] * 1000000L;
-                      while (ts.tv_nsec >= 1000000000L) {
-                          ts.tv_sec++;
-                          ts.tv_nsec -= 1000000000L;
-                      }
-                      pthread_mutex_lock(&mu);
-                      while (g_gen == seen) {
-                          if (pthread_cond_timedwait(&cv, &mu, &ts) == ETIMEDOUT)
-                              break;
-                      }
-                      changed = (g_gen != seen);
-                      t = g_target;
-                      pthread_mutex_unlock(&mu);
-                      if (changed)
-                          break;
-                      if (doze_read() == t)
-                          break;
-                      doze_write(t);
-                  }
+                  if (on)
+                      continue;
+                  if (wait_ms(1000, seen))
+                      continue;
+                  doze_write(0);
+                  doze_write(pref_get());
+                  if (wait_ms(1500, seen))
+                      continue;
+                  doze_write(pref_get());
               }
               return NULL;
           }
@@ -287,11 +280,8 @@ jobs:
               int32_t i, t;
               slot_t *s;
               lg("set", id, 0, v, n);
-              if (id == 217) {
-                  if (n >= 1 && v[0] != 0)
-                      kick();
+              if (id == 217)
                   return 0;
-              }
               pthread_mutex_lock(&smu);
               s = slot_get(id, 1);
               if (s) {
@@ -300,8 +290,12 @@ jobs:
                       s->v[i] = v[i];
               }
               pthread_mutex_unlock(&smu);
-              if (id == 81)
-                  kick();
+              if (id == 81 && n >= 1) {
+                  if (v[0] == 1)
+                      screen_event(1);
+                  else if (v[0] == 0)
+                      screen_event(0);
+              }
               if (id == 7) {
                   if (n < 1)
                       return -EINVAL;
@@ -314,7 +308,7 @@ jobs:
                   pthread_mutex_lock(&mu);
                   g_pref = t;
                   pthread_mutex_unlock(&mu);
-                  doze_target(t);
+                  doze_write(t);
               }
               return 0;
           }
@@ -474,6 +468,18 @@ jobs:
               user root
               group root system
               seclabel u:r:shell:s0
+          EOF
+          cat > out/live.sh <<'EOF'
+          D="$(cd "$(dirname "$0")" && pwd)"
+          N=vendor.oplus.hardware.displaypanelfeature-bridge
+          cp "$D/odm/bin/hw/$N" /data/local/tmp/dpf
+          chmod 755 /data/local/tmp/dpf
+          stop displaypanelfeature_bridge
+          umount "/odm/bin/hw/$N" 2>/dev/null
+          mount --bind /data/local/tmp/dpf "/odm/bin/hw/$N"
+          start displaypanelfeature_bridge
+          sleep 2
+          killall system_server
           EOF
           printf '%s\n' "odm/bin/hw/$NAME 0 2000 0755 capabilities=0x0" "odm/etc/init/$NAME.rc 0 0 0644 capabilities=0x0" > out/fs_config.txt
           NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
